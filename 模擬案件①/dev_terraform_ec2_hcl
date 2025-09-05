@@ -1,0 +1,15 @@
+resource "aws_backup_restore_job" "ec2_restore" {
+  recovery_point_arn = "arn:aws:backup:ap-northeast-3:123456789012:recovery-point:efgh5678"
+  iam_role_arn       = aws_iam_role.backup_role.arn
+
+  metadata = {
+    "TargetInstanceType" = "t3.micro"
+    "SubnetId"           = "subnet-xxxxxx"
+    "SecurityGroupIds"   = "sg-yyyyyy"
+    "KeyPairName"        = "my-keypair"
+  }
+
+  lifecycle {
+    ignore_changes = all
+  }
+}
