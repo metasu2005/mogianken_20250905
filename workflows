@@ -1,0 +1,63 @@
+name: Terraform DR Dev
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  AWS_REGION: ap-northeast-1
+  TFSTATE_BUCKET: tfstate-<account-id>-apne1
+
+jobs:
+  plan-tokyo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/TerraformDeployer
+          aws-region: ap-northeast-1
+      - name: Terraform Init
+        run: |
+          terraform -version
+          terraform init -backend-config="bucket=$TFSTATE_BUCKET" \
+                         -backend-config="key=dr/dev/tokyo.tfstate" \
+                         -backend-config="region=ap-northeast-1"
+      - name: Terraform Plan (Tokyo)
+        run: terraform plan -var-file=envs/tokyo.tfvars
+
+  apply-tokyo:
+    needs: [plan-tokyo]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/TerraformDeployer
+          aws-region: ap-northeast-1
+      - name: Terraform Init
+        run: |
+          terraform init -backend-config="bucket=$TFSTATE_BUCKET" \
+                         -backend-config="key=dr/dev/tokyo.tfstate" \
+                         -backend-config="region=ap-northeast-1"
+      - name: Terraform Apply (Tokyo)
+        run: terraform apply -auto-approve -var-file=envs/tokyo.tfvars
+
+  plan-osaka:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/TerraformDeployer
+          aws-region: ap-northeast-3
+      - name: Terraform Init (state in Tokyo bucket)
+        run: |
+          terraform init -backend-config="bucket=$TFSTATE_BUCKET" \
+                         -backend-config="key=dr/dev/osaka.tfstate" \
+                         -backend-config="region=ap-northeast-1"
+      - name: Terraform Plan (Osaka)
+        run: terraform plan -var-file=envs/osaka.tfvars
