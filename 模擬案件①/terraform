@@ -1,0 +1,517 @@
+# Repo layout (copy these into files)
+
+# ├─ versions.tf
+# ├─ providers.tf
+# ├─ backend.tf              # ← optional: uncomment & fill for remote state
+# ├─ variables.tf
+# ├─ main.tf
+# ├─ outputs.tf
+# └─ envs/
+#    └─ dev.tfvars
+
+####################################
+# versions.tf
+####################################
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.50"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = ">= 3.5"
+    }
+  }
+}
+
+####################################
+# providers.tf
+####################################
+provider "aws" {
+  region = var.aws_region
+}
+
+# If you use ACM DNS validation with Route53, set this too (same account/region for hosted zone)
+provider "aws" {
+  alias  = "us_east_1"       # for ALB HTTP/2 or global certs if ever needed
+  region = "us-east-1"
+}
+
+####################################
+# backend.tf (optional)
+####################################
+# terraform {
+#   backend "s3" {
+#     bucket         = "YOUR-STATE-BUCKET"
+#     key            = "terraform/wordpress/infra.tfstate"
+#     region         = "ap-northeast-1"
+#     dynamodb_table = "YOUR-LOCK-TABLE"
+#     encrypt        = true
+#   }
+# }
+
+####################################
+# variables.tf
+####################################
+variable "project" { type = string  default = "wp" }
+variable "environment" { type = string default = "dev" }
+variable "aws_region" { type = string default = "ap-northeast-1" }
+
+# Networking
+variable "vpc_cidr" { type = string default = "10.30.0.0/16" }
+variable "azs" {
+  type    = list(string)
+  default = ["ap-northeast-1a", "ap-northeast-1c"]
+}
+
+# Domain & certificate
+variable "hosted_zone_id" { type = string description = "Existing Route53 hosted zone ID (public)." }
+variable "domain_name"    { type = string description = "FQDN to create (e.g., app.example.com)." }
+
+# EC2/ASG
+variable "instance_type" { type = string default = "t3.micro" }
+variable "desired_capacity" { type = number default = 2 }
+variable "min_size" { type = number default = 2 }
+variable "max_size" { type = number default = 4 }
+
+# RDS
+variable "db_engine_version" { type = string default = "10.11.6"  # MariaDB 10.11 LTS at time of writing }
+variable "db_instance_class" { type = string default = "db.t3.micro" }
+variable "db_name"           { type = string default = "wordpress" }
+variable "db_username"       { type = string default = "wpuser" }
+
+# Secrets Manager
+variable "create_random_db_password" { type = bool default = true }
+
+# WordPress basic settings
+variable "wp_title"  { type = string default = "My WordPress" }
+variable "wp_admin"  { type = string default = "admin" }
+variable "wp_email"  { type = string default = "admin@example.com" }
+
+####################################
+# main.tf
+####################################
+locals {
+  name = "${var.project}-${var.environment}"
+}
+
+# --- VPC (using terraform-aws-modules/vpc/aws) ---
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name = local.name
+  cidr = var.vpc_cidr
+  azs  = var.azs
+
+  public_subnets  = [for i, az in var.azs : cidrsubnet(var.vpc_cidr, 4, i)]                 # /20s
+  private_subnets = [for i, az in var.azs : cidrsubnet(var.vpc_cidr, 4, i + 8)]             # /20s
+
+  enable_nat_gateway = true
+  single_nat_gateway = false
+
+  # Useful tags
+  tags = {
+    Project     = var.project
+    Environment = var.environment
+  }
+}
+
+# --- Security Groups ---
+resource "aws_security_group" "alb" {
+  name        = "${local.name}-alb"
+  description = "ALB SG"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags = { Name = "${local.name}-alb" }
+}
+
+resource "aws_security_group" "ec2" {
+  name        = "${local.name}-ec2"
+  description = "EC2 (WordPress)"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress {
+    description     = "ALB to EC2"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags = { Name = "${local.name}-ec2" }
+}
+
+resource "aws_security_group" "rds" {
+  name        = "${local.name}-rds"
+  description = "RDS"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress {
+    description     = "EC2 to RDS"
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ec2.id]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags = { Name = "${local.name}-rds" }
+}
+
+# --- Secrets Manager (DB password) ---
+resource "random_password" "db" {
+  length  = 20
+  special = true
+  upper   = true
+  lower   = true
+  number  = true
+  keepers = { name = local.name }
+  count   = var.create_random_db_password ? 1 : 0
+}
+
+resource "aws_secretsmanager_secret" "db" {
+  name        = "${local.name}/rds"
+  description = "DB creds for WordPress"
+}
+
+resource "aws_secretsmanager_secret_version" "db" {
+  secret_id     = aws_secretsmanager_secret.db.id
+  secret_string = jsonencode({
+    username = var.db_username,
+    password = var.create_random_db_password ? random_password.db[0].result : "CHANGEME-STRONG-PASSWORD"
+  })
+}
+
+# --- RDS (MariaDB) ---
+module "db" {
+  source  = "terraform-aws-modules/rds/aws"
+  version = "~> 6.6"
+
+  identifier = "${local.name}-db"
+
+  engine               = "mariadb"
+  engine_version       = var.db_engine_version
+  family               = "mariadb10.11"    # parameter group family
+  major_engine_version = "10.11"
+
+  instance_class        = var.db_instance_class
+  allocated_storage     = 20
+  max_allocated_storage = 100
+
+  db_name  = var.db_name
+  username = var.db_username
+  password = jsondecode(aws_secretsmanager_secret_version.db.secret_string).password
+
+  multi_az               = true
+  publicly_accessible    = false
+  port                   = 3306
+  manage_master_user_password = false
+
+  create_db_subnet_group = true
+  subnet_ids             = module.vpc.private_subnets
+
+  vpc_security_group_ids = [aws_security_group.rds.id]
+
+  backup_retention_period = 7
+  deletion_protection     = false
+  skip_final_snapshot     = true
+
+  tags = {
+    Project     = var.project
+    Environment = var.environment
+  }
+}
+
+# --- IAM role for EC2 to read secret ---
+resource "aws_iam_role" "ec2_role" {
+  name               = "${local.name}-ec2-role"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
+}
+
+data "aws_iam_policy_document" "ec2_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "secrets_read" {
+  name   = "${local.name}-secrets-read"
+  role   = aws_iam_role.ec2_role.id
+  policy = data.aws_iam_policy_document.secrets.json
+}
+
+data "aws_iam_policy_document" "secrets" {
+  statement {
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.db.arn]
+  }
+}
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "${local.name}-instance-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
+# --- Launch template with user_data (installs WordPress + nginx + php-fpm) ---
+locals {
+  user_data = base64encode(templatefile("${path.module}/userdata.sh.tmpl", {
+    secret_arn = aws_secretsmanager_secret.db.arn
+    db_name    = var.db_name
+  }))
+}
+
+resource "aws_launch_template" "wp" {
+  name_prefix   = "${local.name}-lt-"
+  image_id      = data.aws_ami.al2023.id
+  instance_type = var.instance_type
+  update_default_version = true
+
+  iam_instance_profile { name = aws_iam_instance_profile.ec2_profile.name }
+
+  vpc_security_group_ids = [aws_security_group.ec2.id]
+
+  user_data = local.user_data
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = { Name = "${local.name}-wp" }
+  }
+}
+
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["137112412989"] # Amazon
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+# --- Auto Scaling Group ---
+resource "aws_autoscaling_group" "wp" {
+  name                      = "${local.name}-asg"
+  desired_capacity          = var.desired_capacity
+  min_size                  = var.min_size
+  max_size                  = var.max_size
+  vpc_zone_identifier       = module.vpc.private_subnets
+  health_check_type         = "ELB"
+  health_check_grace_period = 120
+
+  launch_template {
+    id      = aws_launch_template.wp.id
+    version = "$Latest"
+  }
+
+  target_group_arns = [aws_lb_target_group.wp.arn]
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name}-wp"
+    propagate_at_launch = true
+  }
+}
+
+# --- ALB & target group & listener ---
+resource "aws_lb" "this" {
+  name               = "${local.name}-alb"
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = module.vpc.public_subnets
+}
+
+resource "aws_lb_target_group" "wp" {
+  name     = "${local.name}-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = module.vpc.vpc_id
+
+  health_check {
+    path                = "/"
+    protocol            = "HTTP"
+    matcher             = "200-399"
+    interval            = 30
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
+    timeout             = 5
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.this.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+# --- ACM certificate (DNS validation) ---
+resource "aws_acm_certificate" "cert" {
+  domain_name       = var.domain_name
+  validation_method = "DNS"
+}
+
+data "aws_route53_zone" "this" {
+  zone_id = var.hosted_zone_id
+}
+
+resource "aws_route53_record" "cert_validation" {
+  for_each = { for dvo in aws_acm_certificate.cert.domain_validation_options : dvo.domain_name => {
+    name   = dvo.resource_record_name
+    record = dvo.resource_record_value
+    type   = dvo.resource_record_type
+  }}
+  zone_id = data.aws_route53_zone.this.zone_id
+  name    = each.value.name
+  type    = each.value.type
+  ttl     = 60
+  records = [each.value.record]
+}
+
+resource "aws_acm_certificate_validation" "cert" {
+  certificate_arn         = aws_acm_certificate.cert.arn
+  validation_record_fqdns = [for r in aws_route53_record.cert_validation : r.fqdn]
+}
+
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.this.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = aws_acm_certificate_validation.cert.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.wp.arn
+  }
+}
+
+# --- Route53 A record (ALIAS) ---
+resource "aws_route53_record" "app" {
+  zone_id = data.aws_route53_zone.this.zone_id
+  name    = var.domain_name
+  type    = "A"
+  alias {
+    name                   = aws_lb.this.dns_name
+    zone_id                = aws_lb.this.zone_id
+    evaluate_target_health = true
+  }
+}
+
+####################################
+# userdata.sh.tmpl (place next to .tf files)
+####################################
+#cloud-config
+package_update: true
+packages:
+  - nginx
+  - php-fpm
+  - php-mysqlnd
+  - php-cli
+  - php-json
+  - php-gd
+  - php-curl
+  - php-mbstring
+  - mariadb105
+runcmd:
+  - |
+    set -eux
+    # Fetch DB creds from Secrets Manager
+    SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "${secret_arn}" --query SecretString --output text || echo '{}')
+    DB_USER=$(echo "$SECRET_JSON" | jq -r '.username')
+    DB_PASS=$(echo "$SECRET_JSON" | jq -r '.password')
+    DB_NAME="${db_name}"
+
+    # Install WordPress
+    cd /tmp
+    curl -L https://wordpress.org/latest.tar.gz -o wp.tgz
+    tar xzf wp.tgz
+    mkdir -p /var/www/html
+    rsync -a wordpress/ /var/www/html/
+    chown -R nginx:nginx /var/www/html
+
+    # Configure wp-config.php
+    cp /var/www/html/wp-config-sample.php /var/www/html/wp-config.php
+    sed -i "s/database_name_here/$DB_NAME/" /var/www/html/wp-config.php
+    sed -i "s/username_here/$DB_USER/" /var/www/html/wp-config.php
+    sed -i "s/password_here/$DB_PASS/" /var/www/html/wp-config.php
+
+    # Nginx simple vhost
+    cat >/etc/nginx/conf.d/wp.conf <<'NGINX'
+    server {
+      listen 80 default_server;
+      root /var/www/html;
+      index index.php index.html;
+      location / { try_files $uri $uri/ /index.php?$args; }
+      location ~ \.php$ { include /etc/nginx/fastcgi_params; fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name; fastcgi_pass 127.0.0.1:9000; }
+    }
+NGINX
+    systemctl enable --now php-fpm nginx
+
+####################################
+# outputs.tf
+####################################
+output "alb_dns" { value = aws_lb.this.dns_name }
+output "domain_name" { value = var.domain_name }
+output "rds_endpoint" { value = module.db.db_instance_address }
+
+####################################
+# envs/dev.tfvars (example values)
+####################################
+project         = "memoapp"
+environment     = "dev"
+aws_region      = "ap-northeast-1"
+
+# Route53 public hosted zone that already exists in your account
+hosted_zone_id  = "Z1234567890ABCDEFG"
+domain_name     = "app.example.com"
+
+instance_type     = "t3.micro"
+desired_capacity  = 2
+min_size          = 2
+max_size          = 4
+
+db_engine_version = "10.11.6"
+db_instance_class = "db.t3.micro"
+db_name           = "wordpress"
+db_username       = "wpuser"
